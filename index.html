@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="買入表" />
+  <meta name="theme-color" content="#f59e0b" />
+  <title>每月買入表</title>
+  <link rel="manifest" href="/manifest.json" />
+  <!-- Apple touch icon fallback (inline SVG as data URI) -->
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;600;700;900&display=swap" rel="stylesheet" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root {
+      height: 100%;
+      background: #fdf6ec;
+      font-family: 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
+    }
+    body { overscroll-behavior: none; }
+    select option { color: #1c1917; background: #fff; }
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+    button:active { opacity: 0.8; }
+    ::-webkit-scrollbar { display: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React + Babel via CDN (no build step needed) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    // ─── Storage ──────────────────────────────────────────────────────────────
+    const STORAGE_KEY = "monthly_invest_v1";
+    function loadData() {
+      try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : null; } catch { return null; }
+    }
+    function saveData(d) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch {}
+    }
+
+    function createDefaultState() { return { plans: [], activePlanId: null }; }
+
+    function createPlan({ name, totalAmount, currency, months, reminderDay }) {
+      return {
+        id: Date.now().toString(), name,
+        totalAmount: Number(totalAmount), currency: currency || "TWD",
+        months: Number(months), reminderDay: Number(reminderDay),
+        targets: [], currentMonth: 1, monthlyRecords: {},
+        createdAt: new Date().toISOString(), modifyLog: [],
+      };
+    }
+
+    function formatMoney(amount, currency) {
+      const sym = currency === "USD" ? "US$" : "NT$";
+      return `${sym}${Number(amount).toLocaleString("zh-TW", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
+    }
+    function totalRatio(targets) { return targets.reduce((s, t) => s + Number(t.ratio || 0), 0); }
+
+    const SKIP_REASONS = [
+      { value: "cash_need",   label: "家裡臨時需要用錢",   emotional: false },
+      { value: "cashflow",    label: "現金流改變",           emotional: false },
+      { value: "fundamental", label: "原本標的基本面改變",   emotional: false },
+      { value: "fear_drop",   label: "害怕下跌",              emotional: true  },
+      { value: "wait_lower",  label: "想等更低點",            emotional: true  },
+      { value: "news_friend", label: "看到新聞或朋友建議",   emotional: true  },
+    ];
+    const MODIFY_REASONS = [
+      { value: "family_fund", label: "家庭資金狀況改變",   emotional: false },
+      { value: "longterm",    label: "長期資產配置改變",   emotional: false },
+      { value: "fundamental", label: "標的基本面改變",     emotional: false },
+      { value: "news",        label: "看到短期新聞",        emotional: true  },
+      { value: "fear_drop",   label: "害怕下跌",            emotional: true  },
+      { value: "chase_high",  label: "想追高",              emotional: true  },
+      { value: "friend",      label: "親友建議",            emotional: true  },
+    ];
+
+    // ─── Notification helpers ─────────────────────────────────────────────────
+    async function requestNotificationPermission() {
+      if (!("Notification" in window)) return "unsupported";
+      if (Notification.permission === "granted") return "granted";
+      if (Notification.permission === "denied") return "denied";
+      const result = await Notification.requestPermission();
+      return result;
+    }
+
+    function scheduleMonthlyReminder(plan) {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      if (!plan) return;
+
+      const now = new Date();
+      const today = now.getDate();
+      const reminderDay = plan.reminderDay;
+
+      // Calculate ms until next reminder
+      let target = new Date(now.getFullYear(), now.getMonth(), reminderDay, 9, 0, 0);
+      if (today > reminderDay || (today === reminderDay && now.getHours() >= 9)) {
+        // Already passed this month → schedule next month
+        target = new Date(now.getFullYear(), now.getMonth() + 1, reminderDay, 9, 0, 0);
+      }
+
+      const msUntil = target.getTime() - now.getTime();
+
+      // Store scheduled time in localStorage so we can check on next open
+      localStorage.setItem("next_reminder_" + plan.id, target.toISOString());
+
+      // Use setTimeout for same-session scheduling (works when app is open)
+      // For background: iOS will fire if app was opened recently and SW is active
+      if (msUntil > 0 && msUntil < 7 * 24 * 60 * 60 * 1000) {
+        setTimeout(() => {
+          fireNotification(plan);
+        }, msUntil);
+      }
+    }
+
+    function fireNotification(plan) {
+      if (!plan || Notification.permission !== "granted") return;
+      const monthlyTotal = plan.totalAmount / plan.months;
+      const body = `本月應投入 ${formatMoney(monthlyTotal, plan.currency)}，這是第 ${plan.currentMonth}/${plan.months} 個月。請按計畫執行！`;
+      try {
+        if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
+          navigator.serviceWorker.ready.then(reg => {
+            reg.showNotification(`📅 ${plan.name} — 本月買入提醒`, {
+              body,
+              icon: "/icon-192.png",
+              badge: "/icon-192.png",
+              tag: "monthly-invest-" + plan.id,
+              requireInteraction: true,
+              vibrate: [200, 100, 200],
+            });
+          });
+        } else {
+          new Notification(`📅 ${plan.name} — 本月買入提醒`, { body });
+        }
+      } catch(e) { console.log("Notification error:", e); }
+    }
+
+    // Check if today is reminder day on app open
+    function checkTodayReminder(plan) {
+      if (!plan || Notification.permission !== "granted") return;
+      const today = new Date().getDate();
+      if (today === plan.reminderDay) {
+        const lastFired = localStorage.getItem("last_fired_" + plan.id);
+        const todayStr = new Date().toDateString();
+        if (lastFired !== todayStr) {
+          localStorage.setItem("last_fired_" + plan.id, todayStr);
+          setTimeout(() => fireNotification(plan), 1500);
+        }
+      }
+    }
+
+    // ─── APP ──────────────────────────────────────────────────────────────────
+    function App() {
+      const [appData, setAppData] = useState(() => loadData() || createDefaultState());
+      const [tab, setTab] = useState("overview");
+      const [notifStatus, setNotifStatus] = useState(
+        "Notification" in window ? Notification.permission : "unsupported"
+      );
+
+      useEffect(() => { saveData(appData); }, [appData]);
+
+      // Register SW
+      useEffect(() => {
+        if ("serviceWorker" in navigator) {
+          navigator.serviceWorker.register("/sw.js").catch(() => {});
+        }
+      }, []);
+
+      // Check reminder on load
+      const activePlan = appData.plans.find(p => p.id === appData.activePlanId) || appData.plans[0] || null;
+      useEffect(() => {
+        if (activePlan) {
+          checkTodayReminder(activePlan);
+          scheduleMonthlyReminder(activePlan);
+        }
+      }, [activePlan?.id]);
+
+      function updatePlan(id, updater) {
+        setAppData(prev => ({ ...prev, plans: prev.plans.map(p => p.id === id ? updater(p) : p) }));
+      }
+      function setActivePlan(id) { setAppData(prev => ({ ...prev, activePlanId: id })); }
+      function addPlan(plan) {
+        setAppData(prev => ({ ...prev, plans: [...prev.plans, plan], activePlanId: plan.id }));
+      }
+      function deletePlan(id) {
+        setAppData(prev => {
+          const plans = prev.plans.filter(p => p.id !== id);
+          return { ...prev, plans, activePlanId: plans.length > 0 ? plans[0].id : null };
+        });
+      }
+
+      async function handleRequestNotif() {
+        const result = await requestNotificationPermission();
+        setNotifStatus(result);
+        if (result === "granted" && activePlan) {
+          checkTodayReminder(activePlan);
+          scheduleMonthlyReminder(activePlan);
+        }
+      }
+
+      const hasPlans = appData.plans.length > 0;
+
+      return (
+        <div style={S.app}>
+          <TopBar plans={appData.plans} activePlan={activePlan} onSelect={setActivePlan} />
+
+          {/* Notification banner */}
+          {notifStatus !== "granted" && notifStatus !== "unsupported" && (
+            <div style={S.notifBanner}>
+              <span style={S.notifBannerText}>
+                {notifStatus === "denied"
+                  ? "⚠️ 通知已被封鎖，請至手機設定開啟"
+                  : "🔔 開啟通知，每月提醒日自動提醒你"}
+              </span>
+              {notifStatus !== "denied" && (
+                <button style={S.notifBtn} onClick={handleRequestNotif}>開啟</button>
+              )}
+            </div>
+          )}
+          {notifStatus === "granted" && (
+            <div style={S.notifGranted}>✓ 通知已開啟，每月 {activePlan?.reminderDay || "–"} 號會提醒你</div>
+          )}
+
+          <main style={S.main}>
+            {tab === "overview" && <OverviewPage plan={activePlan} hasPlans={hasPlans} onGoManage={() => setTab("manage")} />}
+            {tab === "manage"   && <ManagePage plans={appData.plans} activePlan={activePlan} onAdd={addPlan} onUpdate={updatePlan} onDelete={deletePlan} onSelect={setActivePlan} />}
+            {tab === "tasks"    && <TasksPage plan={activePlan} onUpdate={updatePlan} />}
+            {tab === "records"  && <RecordsPage plan={activePlan} />}
+          </main>
+
+          <BottomNav tab={tab} onChange={setTab} />
+
+          <div style={S.disclaimer}>
+            本工具僅用於紀律提醒與金額計算，不提供投資建議，不推薦任何股票或 ETF，也不保證投資報酬。使用者應自行判斷投資風險。
+          </div>
+        </div>
+      );
+    }
+
+    // ─── TopBar ───────────────────────────────────────────────────────────────
+    function TopBar({ plans, activePlan, onSelect }) {
+      return (
+        <header style={S.topBar}>
+          <span style={S.topBarTitle}>📅 每月買入表</span>
+          {plans.length > 0 ? (
+            <select style={S.planSelect} value={activePlan?.id || ""} onChange={e => onSelect(e.target.value)}>
+              {plans.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          ) : (
+            <span style={S.noPlanHint}>尚未建立計畫</span>
+          )}
+        </header>
+      );
+    }
+
+    // ─── BottomNav ────────────────────────────────────────────────────────────
+    function BottomNav({ tab, onChange }) {
+      const items = [
+        { id: "overview", icon: "📊", label: "總覽" },
+        { id: "manage",   icon: "⚙️",  label: "管理計畫" },
+        { id: "tasks",    icon: "✅",  label: "本月任務" },
+        { id: "records",  icon: "📋",  label: "紀錄" },
+      ];
+      return (
+        <nav style={S.bottomNav}>
+          {items.map(item => (
+            <button key={item.id} style={{ ...S.navBtn, ...(tab === item.id ? S.navBtnActive : {}) }} onClick={() => onChange(item.id)}>
+              <span style={S.navIcon}>{item.icon}</span>
+              <span style={S.navLabel}>{item.label}</span>
+            </button>
+          ))}
+        </nav>
+      );
+    }
+
+    // ─── OverviewPage ─────────────────────────────────────────────────────────
+    function OverviewPage({ plan, hasPlans, onGoManage }) {
+      if (!hasPlans || !plan) {
+        return (
+          <div style={S.emptyState}>
+            <div style={S.emptyIcon}>🌱</div>
+            <div style={S.emptyTitle}>還沒有投資計畫</div>
+            <div style={S.emptyDesc}>點選下方「管理計畫」開始建立你的第一個計畫</div>
+            <button style={S.primaryBtn} onClick={onGoManage}>建立計畫</button>
+          </div>
+        );
+      }
+      const monthlyTotal = plan.totalAmount / plan.months;
+      const completedMonths = Object.entries(plan.monthlyRecords).filter(([, r]) => {
+        const allIds = plan.targets.map(t => t.id);
+        return allIds.length > 0 && allIds.every(id => r.completed?.includes(id));
+      }).length;
+      const skippedMonths = Object.values(plan.monthlyRecords).filter(r => r.skipped).length;
+      const investedAmount = completedMonths * monthlyTotal;
+      const progressPct = plan.months > 0 ? Math.round((plan.currentMonth - 1) / plan.months * 100) : 0;
+
+      return (
+        <div style={S.page}>
+          <h2 style={S.pageTitle}>{plan.name}</h2>
+          <div style={S.card}>
+            <div style={S.cardLabel}>整體進度</div>
+            <div style={S.progressBar}><div style={{ ...S.progressFill, width: `${Math.min(progressPct,100)}%` }} /></div>
+            <div style={S.progressText}>{plan.currentMonth - 1} / {plan.months} 個月已執行</div>
+            <div style={S.statsRow}>
+              <Stat label="計畫總金額" value={formatMoney(plan.totalAmount, plan.currency)} />
+              <Stat label="已投入金額" value={formatMoney(investedAmount, plan.currency)} />
+              <Stat label="每月投入"   value={formatMoney(monthlyTotal, plan.currency)} />
+            </div>
+          </div>
+          <div style={S.card}>
+            <div style={S.cardLabel}>投資標的配置</div>
+            {plan.targets.length === 0
+              ? <div style={S.hintText}>尚未設定標的，請至「管理計畫」新增</div>
+              : plan.targets.map(t => (
+                <div key={t.id} style={S.targetRow}>
+                  <span style={S.targetName}>{t.name}</span>
+                  <span style={S.targetRatio}>{t.ratio}%</span>
+                  <span style={S.targetAmount}>{formatMoney(monthlyTotal * t.ratio / 100, plan.currency)}<span style={S.perMonth}>/月</span></span>
+                </div>
+              ))
+            }
+          </div>
+          <div style={S.card}>
+            <div style={S.cardLabel}>執行狀況</div>
+            <div style={S.statsRow}>
+              <Stat label="已完成月數" value={`${completedMonths} 個月`} />
+              <Stat label="跳過月數"   value={`${skippedMonths} 個月`} />
+              <Stat label="目前月份"   value={`第 ${plan.currentMonth} 月`} />
+            </div>
+          </div>
+          <div style={S.card}>
+            <div style={S.cardLabel}>提醒設定</div>
+            <div style={S.reminderInfo}>每月 <strong>{plan.reminderDay}</strong> 號提醒</div>
+          </div>
+        </div>
+      );
+    }
+
+    function Stat({ label, value }) {
+      return (
+        <div style={S.stat}>
+          <div style={S.statLabel}>{label}</div>
+          <div style={S.statValue}>{value}</div>
+        </div>
+      );
+    }
+
+    // ─── ManagePage ───────────────────────────────────────────────────────────
+    function ManagePage({ plans, activePlan, onAdd, onUpdate, onDelete, onSelect }) {
+      const [view, setView] = useState("list");
+      const [editingPlan, setEditingPlan] = useState(null);
+      const [modifyModal, setModifyModal] = useState(false);
+
+      function handleEditClick(plan) { setEditingPlan(plan); setModifyModal(true); }
+      function handleModifyConfirm(reason) {
+        setModifyModal(false);
+        if (reason) setView("edit");
+      }
+
+      if (view === "create") {
+        return <PlanForm onSave={(plan) => { onAdd(plan); setView("list"); }} onCancel={() => setView("list")} />;
+      }
+      if (view === "edit" && editingPlan) {
+        return (
+          <PlanForm
+            initial={editingPlan}
+            onSave={(updated) => { onUpdate(editingPlan.id, () => ({ ...editingPlan, ...updated })); setView("list"); }}
+            onCancel={() => setView("list")}
+          />
+        );
+      }
+
+      return (
+        <div style={S.page}>
+          <h2 style={S.pageTitle}>管理計畫</h2>
+          <button style={{ ...S.primaryBtn, marginBottom: 16 }} onClick={() => setView("create")}>＋ 新增投資計畫</button>
+          {plans.length === 0 && <div style={S.hintText}>尚未建立任何計畫</div>}
+          {plans.map(plan => (
+            <div key={plan.id} style={{ ...S.card, ...(plan.id === activePlan?.id ? S.cardActive : {}) }}>
+              <div style={S.planCardHeader}>
+                <span style={S.planCardName}>{plan.name}</span>
+                {plan.id === activePlan?.id && <span style={S.activeBadge}>使用中</span>}
+              </div>
+              <div style={S.planCardInfo}>{formatMoney(plan.totalAmount, plan.currency)} ÷ {plan.months} 個月</div>
+              <div style={S.planCardInfo}>每月 {plan.reminderDay} 號提醒</div>
+              <div style={S.planCardActions}>
+                <button style={S.secondaryBtn} onClick={() => onSelect(plan.id)}>選用</button>
+                <button style={S.outlineBtn2} onClick={() => handleEditClick(plan)}>修改</button>
+                <button style={S.dangerBtn} onClick={() => { if (window.confirm("確定要刪除這個計畫嗎？")) onDelete(plan.id); }}>刪除</button>
+              </div>
+            </div>
+          ))}
+          {modifyModal && <ModifyProtectionModal onConfirm={handleModifyConfirm} onCancel={() => setModifyModal(false)} />}
+        </div>
+      );
+    }
+
+    // ─── PlanForm ─────────────────────────────────────────────────────────────
+    function PlanForm({ initial, onSave, onCancel }) {
+      const isEdit = !!initial;
+      const [name, setName] = useState(initial?.name || "");
+      const [totalAmount, setTotalAmount] = useState(initial?.totalAmount || "");
+      const [currency, setCurrency] = useState(initial?.currency || "TWD");
+      const [months, setMonths] = useState(initial?.months || "12");
+      const [reminderDay, setReminderDay] = useState(initial?.reminderDay || "5");
+      const [targets, setTargets] = useState(initial?.targets || []);
+      const [errors, setErrors] = useState({});
+
+      const ratioSum = totalRatio(targets);
+
+      function addTarget() { setTargets(prev => [...prev, { id: Date.now().toString(), name: "", ratio: "" }]); }
+      function updateTarget(id, field, val) { setTargets(prev => prev.map(t => t.id === id ? { ...t, [field]: val } : t)); }
+      function removeTarget(id) { setTargets(prev => prev.filter(t => t.id !== id)); }
+
+      function validate() {
+        const e = {};
+        if (!name.trim()) e.name = "請輸入計畫名稱";
+        if (!totalAmount || isNaN(totalAmount) || Number(totalAmount) <= 0) e.totalAmount = "請輸入有效金額";
+        if (!months || isNaN(months) || Number(months) < 1) e.months = "請輸入有效月數";
+        if (!reminderDay || Number(reminderDay) < 1 || Number(reminderDay) > 28) e.reminderDay = "請輸入 1–28";
+        if (targets.length > 0 && ratioSum !== 100) e.ratio = `比例合計為 ${ratioSum}%，必須等於 100%`;
+        targets.forEach((t, i) => {
+          if (!t.name.trim()) e[`tname_${i}`] = "請輸入標的名稱";
+          if (!t.ratio || isNaN(t.ratio) || Number(t.ratio) <= 0) e[`tratio_${i}`] = "請輸入比例";
+        });
+        return e;
+      }
+
+      function handleSave() {
+        const e = validate();
+        if (Object.keys(e).length > 0) { setErrors(e); return; }
+        const data = { name: name.trim(), totalAmount: Number(totalAmount), currency, months: Number(months), reminderDay: Number(reminderDay), targets: targets.map(t => ({ ...t, ratio: Number(t.ratio) })) };
+        onSave(isEdit ? data : createPlan(data));
+      }
+
+      return (
+        <div style={S.page}>
+          <h2 style={S.pageTitle}>{isEdit ? "修改計畫" : "建立新計畫"}</h2>
+          <div style={S.card}>
+            <Field label="計畫名稱" error={errors.name}>
+              <input style={S.input} value={name} onChange={e => setName(e.target.value)} placeholder="例：退休金分批買入計畫" />
+            </Field>
+            <Field label="幣別">
+              <select style={S.input} value={currency} onChange={e => setCurrency(e.target.value)}>
+                <option value="TWD">TWD（新台幣）</option>
+                <option value="USD">USD（美元）</option>
+              </select>
+            </Field>
+            <Field label="總投入金額" error={errors.totalAmount}>
+              <input style={S.input} type="number" value={totalAmount} onChange={e => setTotalAmount(e.target.value)} placeholder="例：600000" />
+            </Field>
+            <Field label="分批月數" error={errors.months}>
+              <input style={S.input} type="number" value={months} onChange={e => setMonths(e.target.value)} placeholder="例：12" min="1" />
+            </Field>
+            <Field label="每月提醒日（每月幾號）" error={errors.reminderDay}>
+              <input style={S.input} type="number" value={reminderDay} onChange={e => setReminderDay(e.target.value)} placeholder="例：5" min="1" max="28" />
+            </Field>
+          </div>
+
+          <div style={S.card}>
+            <div style={S.cardLabel}>投資標的</div>
+            {targets.length > 0 && (
+              <div style={{ ...S.ratioBadge, background: ratioSum === 100 ? "#d1fae5" : "#fee2e2", color: ratioSum === 100 ? "#065f46" : "#991b1b" }}>
+                目前比例合計：{ratioSum}%　{ratioSum === 100 ? "✓ 正確" : `（還差 ${100 - ratioSum}%）`}
+              </div>
+            )}
+            {errors.ratio && <div style={S.errorText}>{errors.ratio}</div>}
+            {targets.map((t, i) => (
+              <div key={t.id} style={S.targetFormRow}>
+                <div style={{ flex: 2 }}>
+                  <input style={{ ...S.input, ...(errors[`tname_${i}`] ? S.inputError : {}) }} value={t.name} onChange={e => updateTarget(t.id, "name", e.target.value)} placeholder="標的名稱，例：0050" />
+                </div>
+                <div style={{ width: 72 }}>
+                  <input style={{ ...S.input, ...(errors[`tratio_${i}`] ? S.inputError : {}) }} type="number" value={t.ratio} onChange={e => updateTarget(t.id, "ratio", e.target.value)} placeholder="%" min="1" max="100" />
+                </div>
+                <button style={S.removeBtn} onClick={() => removeTarget(t.id)}>✕</button>
+              </div>
+            ))}
+            <button style={S.outlineBtn} onClick={addTarget}>＋ 新增標的</button>
+          </div>
+
+          {totalAmount && months && targets.length > 0 && ratioSum === 100 && (
+            <div style={S.card}>
+              <div style={S.cardLabel}>每月買入預覽</div>
+              <div style={S.previewTotal}>每月總投入：{formatMoney(Number(totalAmount) / Number(months), currency)}</div>
+              {targets.map(t => (
+                <div key={t.id} style={S.previewRow}>
+                  <span>{t.name}</span><span>{t.ratio}%</span>
+                  <span style={S.previewAmount}>{formatMoney(Number(totalAmount) / Number(months) * Number(t.ratio) / 100, currency)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={S.formActions}>
+            <button style={S.primaryBtn} onClick={handleSave}>{isEdit ? "儲存修改" : "建立計畫"}</button>
+            <button style={S.outlineBtn} onClick={onCancel}>取消</button>
+          </div>
+        </div>
+      );
+    }
+
+    function Field({ label, children, error }) {
+      return (
+        <div style={S.fieldGroup}>
+          <label style={S.fieldLabel}>{label}</label>
+          {children}
+          {error && <div style={S.errorText}>{error}</div>}
+        </div>
+      );
+    }
+
+    // ─── TasksPage ────────────────────────────────────────────────────────────
+    function TasksPage({ plan, onUpdate }) {
+      const [skipModal, setSkipModal] = useState(false);
+      const [copied, setCopied] = useState(false);
+
+      if (!plan) return <NoPlanPrompt />;
+
+      const monthlyTotal = plan.totalAmount / plan.months;
+      const record = plan.monthlyRecords[plan.currentMonth] || { completed: [], skipped: false };
+      const allCompleted = plan.targets.length > 0 && plan.targets.every(t => record.completed?.includes(t.id));
+      const isSkipped = record.skipped;
+      const isPlanDone = plan.currentMonth > plan.months;
+
+      function toggleTarget(tid) {
+        onUpdate(plan.id, p => {
+          const rec = p.monthlyRecords[p.currentMonth] || { completed: [], skipped: false };
+          const completed = rec.completed?.includes(tid) ? rec.completed.filter(id => id !== tid) : [...(rec.completed || []), tid];
+          return { ...p, monthlyRecords: { ...p.monthlyRecords, [p.currentMonth]: { ...rec, completed } } };
+        });
+      }
+
+      function markAllComplete() {
+        onUpdate(plan.id, p => {
+          const rec = p.monthlyRecords[p.currentMonth] || { completed: [], skipped: false };
+          return { ...p, monthlyRecords: { ...p.monthlyRecords, [p.currentMonth]: { ...rec, completed: p.targets.map(t => t.id) } } };
+        });
+      }
+
+      function advanceMonth() {
+        if (plan.currentMonth >= plan.months) return;
+        onUpdate(plan.id, p => ({ ...p, currentMonth: p.currentMonth + 1 }));
+      }
+
+      function handleSkip(reason) {
+        onUpdate(plan.id, p => {
+          const rec = p.monthlyRecords[p.currentMonth] || { completed: [], skipped: false };
+          return { ...p, monthlyRecords: { ...p.monthlyRecords, [p.currentMonth]: { ...rec, skipped: true, skipReason: reason } } };
+        });
+        setSkipModal(false);
+      }
+
+      function generateLineText() {
+        return [
+          `本月投資計畫提醒：`, ``,
+          `這是第 ${plan.currentMonth} / ${plan.months} 個月。`, ``,
+          `本月應投入總額：${formatMoney(monthlyTotal, plan.currency)}`, ``,
+          ...plan.targets.map(t => `${t.name}：${formatMoney(monthlyTotal * t.ratio / 100, plan.currency)}`),
+          ``, `請按照原本計畫執行。分批買入的重點不是猜最低點，而是保持紀律。`,
+        ].join("\n");
+      }
+
+      function copyLine() {
+        navigator.clipboard.writeText(generateLineText()).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+      }
+
+      return (
+        <div style={S.page}>
+          <h2 style={S.pageTitle}>本月買入任務</h2>
+
+          {isPlanDone ? (
+            <div style={{ ...S.card, textAlign: "center" }}>
+              <div style={{ fontSize: 48, marginBottom: 8 }}>🎉</div>
+              <div style={{ fontSize: 20, fontWeight: "800", color: "#92400e" }}>計畫已全部完成！</div>
+              <div style={{ color: "#a16207", marginTop: 8 }}>恭喜你堅持完成了 {plan.months} 個月的分批買入計畫。</div>
+            </div>
+          ) : (
+            <>
+              <div style={S.monthBadge}>第 <span style={S.monthNum}>{plan.currentMonth}</span> / {plan.months} 個月</div>
+              {isSkipped && <div style={S.skippedBanner}>⏭ 本月已跳過</div>}
+
+              <div style={S.card}>
+                <div style={S.cardLabel}>本月總投入</div>
+                <div style={S.bigAmount}>{formatMoney(monthlyTotal, plan.currency)}</div>
+              </div>
+
+              <div style={S.card}>
+                <div style={S.cardLabel}>本月買入清單</div>
+                {plan.targets.length === 0
+                  ? <div style={S.hintText}>尚未設定標的</div>
+                  : plan.targets.map(t => {
+                    const done = record.completed?.includes(t.id);
+                    return (
+                      <div key={t.id} style={{ ...S.checkRow, ...(done ? S.checkRowDone : {}) }} onClick={() => !isSkipped && toggleTarget(t.id)}>
+                        <div style={{ ...S.checkbox, ...(done ? S.checkboxDone : {}) }}>
+                          {done && <span style={S.checkmark}>✓</span>}
+                        </div>
+                        <div style={S.checkContent}>
+                          <span style={S.checkName}>{t.name}</span>
+                          <span style={S.checkRatio}>{t.ratio}%</span>
+                        </div>
+                        <div style={S.checkAmount}>{formatMoney(monthlyTotal * t.ratio / 100, plan.currency)}</div>
+                      </div>
+                    );
+                  })
+                }
+                {plan.targets.length > 0 && !isSkipped && (
+                  <button style={{ ...S.primaryBtn, marginTop: 16, opacity: allCompleted ? 0.6 : 1 }} onClick={markAllComplete} disabled={allCompleted}>
+                    {allCompleted ? "✓ 本月已全部完成" : "本月全部完成"}
+                  </button>
+                )}
+              </div>
+
+              {!isSkipped && (
+                <div style={S.card}>
+                  <button style={S.skipBtn} onClick={() => setSkipModal(true)}>這個月先跳過</button>
+                </div>
+              )}
+
+              {(allCompleted || isSkipped) && plan.currentMonth < plan.months && (
+                <div style={S.card}>
+                  <button style={S.advanceBtn} onClick={advanceMonth}>前往第 {plan.currentMonth + 1} 個月 →</button>
+                </div>
+              )}
+            </>
+          )}
+
+          <div style={S.card}>
+            <div style={S.cardLabel}>LINE 提醒文字</div>
+            <pre style={S.linePreview}>{generateLineText()}</pre>
+            <button style={S.primaryBtn} onClick={copyLine}>{copied ? "✓ 已複製！" : "複製提醒文字"}</button>
+          </div>
+
+          {skipModal && <SkipModal onConfirm={handleSkip} onCancel={() => setSkipModal(false)} />}
+        </div>
+      );
+    }
+
+    // ─── RecordsPage ──────────────────────────────────────────────────────────
+    function RecordsPage({ plan }) {
+      if (!plan) return <NoPlanPrompt />;
+      const monthlyTotal = plan.totalAmount / plan.months;
+      return (
+        <div style={S.page}>
+          <h2 style={S.pageTitle}>執行紀錄</h2>
+          {Array.from({ length: plan.months }, (_, i) => i + 1).map(month => {
+            const rec = plan.monthlyRecords[month] || { completed: [], skipped: false };
+            const allDone = plan.targets.length > 0 && plan.targets.every(t => rec.completed?.includes(t.id));
+            const isFuture = month > plan.currentMonth;
+            const skipReason = SKIP_REASONS.find(r => r.value === rec.skipReason);
+            return (
+              <div key={month} style={{ ...S.card, opacity: isFuture ? 0.35 : 1 }}>
+                <div style={S.recordHeader}>
+                  <span style={S.recordMonth}>第 {month} 個月</span>
+                  <span style={{ ...S.recordStatus, background: isFuture ? "#e5e7eb" : rec.skipped ? "#fef3c7" : allDone ? "#d1fae5" : "#fee2e2", color: isFuture ? "#9ca3af" : rec.skipped ? "#92400e" : allDone ? "#065f46" : "#991b1b" }}>
+                    {isFuture ? "尚未到達" : rec.skipped ? "跳過" : allDone ? "✓ 完成" : "未完成"}
+                  </span>
+                </div>
+                {!isFuture && (
+                  <div style={S.recordDetail}>
+                    <div style={{ marginBottom: 4 }}>應投入：{formatMoney(monthlyTotal, plan.currency)}</div>
+                    {rec.skipped && skipReason && <div>跳過原因：{skipReason.label}</div>}
+                    {!rec.skipped && plan.targets.map(t => (
+                      <div key={t.id} style={{ color: rec.completed?.includes(t.id) ? "#059669" : "#dc2626" }}>
+                        {rec.completed?.includes(t.id) ? "✓" : "✗"} {t.name}：{formatMoney(monthlyTotal * t.ratio / 100, plan.currency)}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─── Modals ───────────────────────────────────────────────────────────────
+    function SkipModal({ onConfirm, onCancel }) {
+      const [reason, setReason] = useState("");
+      const [showWarning, setShowWarning] = useState(false);
+      function handleSelect(r) { setReason(r.value); setShowWarning(r.emotional); }
+      return (
+        <div style={S.modalOverlay}>
+          <div style={S.modal}>
+            <div style={S.modalTitle}>⏭ 跳過本月買入</div>
+            <div style={S.modalDesc}>你正在跳過原本的分批買入計畫。請確認原因：</div>
+            {SKIP_REASONS.map(r => (
+              <button key={r.value} style={{ ...S.reasonBtn, ...(reason === r.value ? S.reasonBtnActive : {}) }} onClick={() => handleSelect(r)}>{r.label}</button>
+            ))}
+            {showWarning && <div style={S.warningBox}>⚠️ 這可能是情緒反應。分批買入的目的就是降低猜測買點的壓力。建議先保留原計畫，24 小時後再決定是否修改。</div>}
+            <div style={S.modalActions}>
+              <button style={S.outlineBtn} onClick={onCancel}>取消，繼續執行</button>
+              <button style={{ ...S.skipBtn, opacity: reason ? 1 : 0.4 }} onClick={() => reason && onConfirm(reason)} disabled={!reason}>確認跳過</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function ModifyProtectionModal({ onConfirm, onCancel }) {
+      const [reason, setReason] = useState("");
+      const [showWarning, setShowWarning] = useState(false);
+      function handleSelect(r) { setReason(r.value); setShowWarning(r.emotional); }
+      return (
+        <div style={S.modalOverlay}>
+          <div style={S.modal}>
+            <div style={S.modalTitle}>✏️ 修改計畫確認</div>
+            <div style={S.modalDesc}>你正在修改原本的投資計畫。請確認這是因為資金狀況或長期配置改變，而不是短期市場情緒。</div>
+            {MODIFY_REASONS.map(r => (
+              <button key={r.value} style={{ ...S.reasonBtn, ...(reason === r.value ? S.reasonBtnActive : {}) }} onClick={() => handleSelect(r)}>{r.label}</button>
+            ))}
+            {showWarning && <div style={S.warningBox}>⚠️ 這可能不是理性的長期配置調整。建議先不要修改計畫，明天再重新確認。</div>}
+            <div style={S.modalActions}>
+              <button style={S.outlineBtn} onClick={onCancel}>取消，不修改</button>
+              <button style={{ ...S.primaryBtn, opacity: reason ? 1 : 0.4 }} onClick={() => reason && onConfirm(reason)} disabled={!reason}>我仍要修改</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function NoPlanPrompt() {
+      return (
+        <div style={S.emptyState}>
+          <div style={S.emptyIcon}>📋</div>
+          <div style={S.emptyTitle}>請先選擇或建立計畫</div>
+          <div style={S.emptyDesc}>前往「管理計畫」建立你的第一個計畫</div>
+        </div>
+      );
+    }
+
+    // ─── Styles ───────────────────────────────────────────────────────────────
+    const S = {
+      app: { fontFamily: "'Noto Sans TC','PingFang TC','Microsoft JhengHei',sans-serif", background: "#fdf6ec", minHeight: "100vh", display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto", position: "relative" },
+      topBar: { background: "#f59e0b", color: "#fff", padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100, boxShadow: "0 2px 8px rgba(245,158,11,0.3)" },
+      topBarTitle: { fontSize: 17, fontWeight: "800", letterSpacing: 0.5 },
+      planSelect: { background: "rgba(255,255,255,0.25)", border: "1px solid rgba(255,255,255,0.5)", color: "#fff", borderRadius: 8, padding: "6px 10px", fontSize: 14, fontWeight: "600", maxWidth: 170, outline: "none" },
+      noPlanHint: { fontSize: 13, opacity: 0.85 },
+      notifBanner: { background: "#fff7ed", borderBottom: "2px solid #fed7aa", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 },
+      notifBannerText: { fontSize: 13, color: "#c2410c", fontWeight: "600", flex: 1 },
+      notifBtn: { background: "#f59e0b", color: "#fff", border: "none", borderRadius: 8, padding: "7px 16px", fontWeight: "700", fontSize: 14, cursor: "pointer", flexShrink: 0 },
+      notifGranted: { background: "#f0fdf4", borderBottom: "1px solid #bbf7d0", padding: "8px 16px", fontSize: 13, color: "#166534", fontWeight: "600", textAlign: "center" },
+      main: { flex: 1, overflowY: "auto", paddingBottom: 120 },
+      bottomNav: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 480, background: "#fff", borderTop: "2px solid #fde68a", display: "flex", zIndex: 100, boxShadow: "0 -2px 12px rgba(0,0,0,0.08)" },
+      navBtn: { flex: 1, background: "none", border: "none", padding: "10px 0 12px", display: "flex", flexDirection: "column", alignItems: "center", cursor: "pointer", color: "#9ca3af" },
+      navBtnActive: { color: "#d97706" },
+      navIcon: { fontSize: 22 },
+      navLabel: { fontSize: 10, marginTop: 2, fontWeight: "700" },
+      page: { padding: "16px 16px 8px" },
+      pageTitle: { fontSize: 22, fontWeight: "800", color: "#92400e", marginBottom: 16, marginTop: 4 },
+      card: { background: "#fff", borderRadius: 16, padding: 18, marginBottom: 14, boxShadow: "0 2px 8px rgba(245,158,11,0.1)", border: "1px solid #fde68a" },
+      cardActive: { border: "2px solid #f59e0b", boxShadow: "0 4px 16px rgba(245,158,11,0.2)" },
+      cardLabel: { fontSize: 12, fontWeight: "700", color: "#b45309", marginBottom: 10, textTransform: "uppercase", letterSpacing: 0.5 },
+      progressBar: { height: 12, background: "#fde68a", borderRadius: 99, overflow: "hidden", marginBottom: 8 },
+      progressFill: { height: "100%", background: "linear-gradient(90deg,#f59e0b,#d97706)", borderRadius: 99, transition: "width 0.5s ease" },
+      progressText: { textAlign: "right", fontSize: 13, color: "#92400e", marginBottom: 14 },
+      statsRow: { display: "flex", gap: 8, flexWrap: "wrap" },
+      stat: { flex: 1, background: "#fef9ee", borderRadius: 10, padding: "10px 8px", textAlign: "center", minWidth: 90 },
+      statLabel: { fontSize: 11, color: "#b45309", marginBottom: 4, fontWeight: "600" },
+      statValue: { fontSize: 14, fontWeight: "800", color: "#92400e" },
+      targetRow: { display: "flex", alignItems: "center", padding: "10px 0", borderBottom: "1px solid #fef3c7", gap: 8 },
+      targetName: { flex: 1, fontWeight: "700", fontSize: 16, color: "#1c1917" },
+      targetRatio: { fontSize: 13, color: "#b45309", fontWeight: "600", width: 36, textAlign: "right" },
+      targetAmount: { fontSize: 15, fontWeight: "700", color: "#92400e", textAlign: "right", minWidth: 88 },
+      perMonth: { fontSize: 11, color: "#b45309", fontWeight: "400" },
+      reminderInfo: { fontSize: 15, color: "#374151" },
+      emptyState: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 24px", gap: 12 },
+      emptyIcon: { fontSize: 56 },
+      emptyTitle: { fontSize: 20, fontWeight: "800", color: "#92400e" },
+      emptyDesc: { fontSize: 15, color: "#b45309", textAlign: "center", lineHeight: 1.6 },
+      primaryBtn: { background: "linear-gradient(135deg,#f59e0b,#d97706)", color: "#fff", border: "none", borderRadius: 12, padding: "14px 24px", fontSize: 16, fontWeight: "700", cursor: "pointer", width: "100%", boxShadow: "0 4px 12px rgba(245,158,11,0.35)" },
+      secondaryBtn: { background: "#fef3c7", color: "#92400e", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 14px", fontSize: 14, fontWeight: "600", cursor: "pointer" },
+      outlineBtn: { background: "#fff", color: "#d97706", border: "2px solid #f59e0b", borderRadius: 12, padding: "12px 20px", fontSize: 15, fontWeight: "700", cursor: "pointer", width: "100%" },
+      outlineBtn2: { background: "#fff", color: "#d97706", border: "2px solid #f59e0b", borderRadius: 8, padding: "8px 14px", fontSize: 14, fontWeight: "700", cursor: "pointer" },
+      dangerBtn: { background: "#fee2e2", color: "#991b1b", border: "1px solid #fecaca", borderRadius: 8, padding: "8px 14px", fontSize: 14, fontWeight: "600", cursor: "pointer" },
+      skipBtn: { background: "#fff7ed", color: "#c2410c", border: "2px solid #fed7aa", borderRadius: 12, padding: "12px 20px", fontSize: 15, fontWeight: "700", cursor: "pointer", width: "100%" },
+      advanceBtn: { background: "linear-gradient(135deg,#10b981,#059669)", color: "#fff", border: "none", borderRadius: 12, padding: "14px 24px", fontSize: 16, fontWeight: "700", cursor: "pointer", width: "100%", boxShadow: "0 4px 12px rgba(16,185,129,0.3)" },
+      fieldGroup: { marginBottom: 14 },
+      fieldLabel: { display: "block", fontSize: 14, fontWeight: "700", color: "#92400e", marginBottom: 6 },
+      input: { width: "100%", border: "2px solid #fde68a", borderRadius: 10, padding: "12px 14px", fontSize: 16, background: "#fefce8", color: "#1c1917", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
+      inputError: { borderColor: "#fca5a5", background: "#fff5f5" },
+      errorText: { fontSize: 13, color: "#dc2626", marginTop: 4, fontWeight: "600" },
+      ratioBadge: { borderRadius: 8, padding: "8px 12px", fontSize: 14, fontWeight: "700", marginBottom: 12, textAlign: "center" },
+      targetFormRow: { display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 10 },
+      removeBtn: { background: "#fee2e2", color: "#dc2626", border: "none", borderRadius: 8, width: 40, height: 48, fontSize: 14, cursor: "pointer", flexShrink: 0, marginTop: 2 },
+      previewTotal: { fontSize: 18, fontWeight: "800", color: "#92400e", marginBottom: 10 },
+      previewRow: { display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid #fef3c7", fontSize: 15, color: "#1c1917" },
+      previewAmount: { fontWeight: "700", color: "#d97706" },
+      formActions: { display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 },
+      planCardHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 },
+      planCardName: { fontSize: 17, fontWeight: "800", color: "#1c1917" },
+      activeBadge: { background: "#fef3c7", color: "#d97706", border: "1px solid #fde68a", borderRadius: 6, padding: "2px 8px", fontSize: 12, fontWeight: "700" },
+      planCardInfo: { fontSize: 14, color: "#6b7280", marginBottom: 4 },
+      planCardActions: { display: "flex", gap: 8, marginTop: 12 },
+      monthBadge: { textAlign: "center", fontSize: 17, color: "#92400e", fontWeight: "600", marginBottom: 12, background: "#fef9ee", borderRadius: 12, padding: "10px", border: "1px solid #fde68a" },
+      monthNum: { fontSize: 28, fontWeight: "900", color: "#d97706" },
+      skippedBanner: { background: "#fef3c7", color: "#92400e", borderRadius: 10, padding: "10px 16px", textAlign: "center", fontWeight: "700", fontSize: 15, marginBottom: 12, border: "1px solid #fde68a" },
+      bigAmount: { fontSize: 32, fontWeight: "900", color: "#d97706", textAlign: "center", padding: "4px 0" },
+      checkRow: { display: "flex", alignItems: "center", padding: "14px 0", borderBottom: "1px solid #fef3c7", cursor: "pointer", gap: 12 },
+      checkRowDone: { opacity: 0.55 },
+      checkbox: { width: 28, height: 28, borderRadius: 8, border: "2.5px solid #fbbf24", background: "#fefce8", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" },
+      checkboxDone: { background: "#f59e0b", border: "2.5px solid #d97706" },
+      checkmark: { color: "#fff", fontSize: 16, fontWeight: "900" },
+      checkContent: { flex: 1 },
+      checkName: { fontSize: 17, fontWeight: "700", color: "#1c1917", display: "block" },
+      checkRatio: { fontSize: 13, color: "#b45309", fontWeight: "600" },
+      checkAmount: { fontSize: 16, fontWeight: "800", color: "#d97706", minWidth: 88, textAlign: "right" },
+      linePreview: { background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 10, padding: 14, fontSize: 13, color: "#166534", lineHeight: 1.7, whiteSpace: "pre-wrap", marginBottom: 12, fontFamily: "inherit" },
+      hintText: { fontSize: 14, color: "#9ca3af", textAlign: "center", padding: "12px 0" },
+      recordHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 },
+      recordMonth: { fontSize: 16, fontWeight: "700", color: "#1c1917" },
+      recordStatus: { borderRadius: 6, padding: "4px 10px", fontSize: 13, fontWeight: "700" },
+      recordDetail: { fontSize: 14, color: "#374151", lineHeight: 1.9 },
+      modalOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 999 },
+      modal: { background: "#fff", borderRadius: "20px 20px 0 0", padding: "24px 20px 40px", width: "100%", maxWidth: 480, maxHeight: "85vh", overflowY: "auto" },
+      modalTitle: { fontSize: 20, fontWeight: "800", color: "#92400e", marginBottom: 8 },
+      modalDesc: { fontSize: 15, color: "#374151", lineHeight: 1.6, marginBottom: 16 },
+      reasonBtn: { display: "block", width: "100%", background: "#fef9ee", border: "2px solid #fde68a", borderRadius: 10, padding: "12px 16px", fontSize: 15, fontWeight: "600", color: "#374151", textAlign: "left", cursor: "pointer", marginBottom: 8 },
+      reasonBtnActive: { background: "#fef3c7", border: "2px solid #f59e0b", color: "#92400e" },
+      warningBox: { background: "#fff7ed", border: "2px solid #fed7aa", borderRadius: 12, padding: "14px 16px", fontSize: 14, color: "#c2410c", lineHeight: 1.7, fontWeight: "600", margin: "12px 0" },
+      modalActions: { display: "flex", flexDirection: "column", gap: 10, marginTop: 16 },
+      disclaimer: { fontSize: 11, color: "#9ca3af", textAlign: "center", padding: "8px 16px 20px", lineHeight: 1.6, background: "#fdf6ec" },
+    };
+
+    // ─── Mount ────────────────────────────────────────────────────────────────
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

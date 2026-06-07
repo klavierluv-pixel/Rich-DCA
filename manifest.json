@@ -1,0 +1,24 @@
+{
+  "name": "每月買入表",
+  "short_name": "買入表",
+  "description": "分批買入紀律計算器與提醒表",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fdf6ec",
+  "theme_color": "#f59e0b",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
